@@ -116,10 +116,13 @@ GET  /
 
 Access: our login `Authorization: Bearer` **or** the vault `?key=`
 (no credential → 401 pointing at both). When a Spinny token is saved in
-the vault, both lead endpoints proxy the **real Spinny API** with it
-(response passed through verbatim; Spinny 401/403 → re-verify message).
-With no vault token they fall back to local mode (`"mode": "local"`:
-our lead store + live RC lookup).
+the vault, both lead endpoints proxy the **real Spinny API** with it.
+The GET passes Spinny's reply through verbatim only when it contains a
+real lead (`success: true` / `lead_id` / `lead` / `data`); when Spinny
+reports no lead (or errors), it falls back to local mode
+(`"mode": "local"`: our lead store + live RC lookup, plus
+`"spinny_note"` with Spinny's message). Spinny 401/403 → re-verify
+message. With no vault token the GET/POST are local-only.
 
 Create-a-lead body (JSON):
 

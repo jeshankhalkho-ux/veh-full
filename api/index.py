@@ -909,7 +909,9 @@ def get_lead_by_registration_or_proposal():
     if not valid_reg(reg):
         return jsonify({"status": "failed", "message": f"Invalid registration number: {reg}"}), 400
 
-    # Real Spinny first (vault token), local fallback when no token saved.
+    # Real Spinny first (vault token); fall back to local RC data when no
+    # vault token is saved OR Spinny itself reports no lead.
+    spinny_note = None
     try:
         proxied = _spinny_call("GET", "/get-lead-by-registration-or-proposal/",
                                params={"car_registration_number": reg})
@@ -919,7 +921,13 @@ def get_lead_by_registration_or_proposal():
         code, data = proxied
         if code in (401, 403):
             return _spinny_gone()
-        return jsonify(data), code
+        has_lead = (code == 200 and isinstance(data, dict)
+                    and (data.get("success") is True or data.get("lead_id")
+                         or data.get("lead") or data.get("data")))
+        if has_lead:
+            return jsonify(data), code
+        if isinstance(data, dict) and data.get("message"):
+            spinny_note = str(data["message"])[:200]
 
     lead = get_lead(reg)
     vehicle, sources = lookup_vehicle(reg)
@@ -933,14 +941,17 @@ def get_lead_by_registration_or_proposal():
             "message": "No lead, proposal or vehicle found for this registration number",
         }), 404
 
-    return jsonify({
+    resp = {
         "status": "success",
         "mode": "local",
         "car_registration_number": reg,
         "lead": lead,
         "proposal": (lead or {}).get("proposal"),
         "vehicle": vehicle,
-    })
+    }
+    if spinny_note:
+        resp["spinny_note"] = spinny_note
+    return jsonify(resp)
 
 
 @app.route(f"{BASE}/get-or-create-lead/", methods=["POST"])
