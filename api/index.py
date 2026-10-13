@@ -442,6 +442,14 @@ def require_auth(fn):
     return wrapper
 
 
+@app.errorhandler(429)
+def _rate_limited(e):
+    msg = "Too many attempts — wait a minute and retry"
+    if request.path.startswith(("/api", "/auth")):
+        return jsonify({"ok": False, "status": "failed", "message": msg}), 429
+    return msg, 429
+
+
 @app.route("/auth/login", methods=["POST"])
 @limiter.limit("10 per minute")
 def auth_login():
@@ -559,19 +567,26 @@ async function cur(){
       : 'Current: \\u2014 \\u00b7 exp \\u2014 \\u00b7 MISSING';
   }catch(e){ document.getElementById('cur').textContent='Current: unknown'; }
 }
+async function post(path, body){
+  const ctl=new AbortController();
+  const t=setTimeout(()=>ctl.abort(), 60000);
+  try{
+    const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctl.signal});
+    return await r.json().catch(()=>({ok:false,message:'Server HTTP '+r.status}));
+  }catch(e){ return {ok:false,message:'Network/timeout: '+e.message}; }
+  finally{ clearTimeout(t); }
+}
 async function reqOtp(){
   const phone=document.getElementById('phone').value.trim();
   set('Requesting OTP...','');
-  const r=await fetch('/api/request-otp?key='+encodeURIComponent(KEY),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
-  const j=await r.json();
+  const j=await post('/api/request-otp?key='+encodeURIComponent(KEY),{phone});
   set(j.message||JSON.stringify(j), j.ok?'ok':'bad');
 }
 async function verify(){
   const phone=document.getElementById('phone').value.trim();
   const otp=document.getElementById('otp').value.trim();
-  set('Verifying...','');
-  const r=await fetch('/api/verify-otp?key='+encodeURIComponent(KEY),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,otp})});
-  const j=await r.json();
+  set('Verifying (up to ~60s on cold start)...','');
+  const j=await post('/api/verify-otp?key='+encodeURIComponent(KEY),{phone,otp});
   if(j.ok){ set('Token saved. Expiry: '+j.exp+'\\n'+(j.token||'').slice(0,40)+'...','ok'); cur(); }
   else set(j.message||JSON.stringify(j),'bad');
 }
@@ -632,12 +647,16 @@ def require_vault_key(fn):
 
 
 def _call_spinny(url, payload):
+    t0 = time.time()
     r = requests.post(url, json=payload, headers={
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
         "Origin": "https://www.spinnyinsurance.com",
         "Referer": "https://www.spinnyinsurance.com/",
     }, timeout=20)
+    ms = int((time.time() - t0) * 1000)
+    short = "/".join(url.rstrip("/").rsplit("/", 2)[-2:])
+    logger.info("spinny POST %s -> HTTP %s in %sms", short, r.status_code, ms)
     try:
         data = r.json()
     except ValueError:
@@ -705,7 +724,7 @@ def vault_verify_otp():
     token = _extract_token(data) or cookies.get("access_token")
     if code != 200 or not token:
         msg = data.get("message") if isinstance(data, dict) else None
-        return jsonify({"ok": False, "message": msg or "OTP verification failed"})
+        return jsonify({"ok": False, "message": msg or f"OTP verification failed (HTTP {code})"})
     payload = jwt_payload_unverified(token) or {}
     exp = int(payload.get("exp", 0)) or None
     exp_iso = datetime.fromtimestamp(exp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
@@ -719,6 +738,25 @@ def vault_verify_otp():
 @require_vault_key
 def vault_token_status():
     return jsonify({"ok": True, **vault_status()})
+
+
+def _ping_spinny():
+    r = requests.get("https://api.spinnyinsurance.com/", headers={"User-Agent": USER_AGENT}, timeout=10)
+    return r.status_code
+
+
+@app.route("/api/debug-spinny", methods=["GET"])
+@require_vault_key
+def vault_debug_spinny():
+    """Reachability check: proves TLS/DNS/Cloudflare from the server side."""
+    t0 = time.time()
+    try:
+        code = _ping_spinny()
+        return jsonify({"ok": True, "http_status": code,
+                        "ms": int((time.time() - t0) * 1000)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200],
+                        "ms": int((time.time() - t0) * 1000)})
 
 
 # ------------------------------------------------------------------ routes ---

@@ -81,6 +81,18 @@ Token is accepted from the JSON body or the `Set-Cookie` fallback.
 Vault lives in `api/spinny_token.json` (git-ignored); expiry is decoded
 from the JWT `exp` claim. Tokens are 24-hour, so re-verify daily.
 
+Troubleshooting verify hangs/failures (Render):
+
+- The page now times out at 60s and always shows the result — redeploy and
+  read the exact message instead of a stuck "Verifying...".
+- First tap after idle can take ~30s (free-tier cold start) — wait it out once.
+- `GET /api/debug-spinny?key=abhi` checks server-side reachability to
+  `api.spinnyinsurance.com` (TLS/DNS/Cloudflare). If it fails, Spinny is
+  blocking the host — nothing else will work until that passes.
+- Too many taps → JSON `Too many attempts — wait a minute` (10/min).
+- Render → Logs shows `spinny POST accounts/verify-otp -> HTTP <code>`
+  lines for the real upstream result.
+
 ## Endpoints
 
 ```text
