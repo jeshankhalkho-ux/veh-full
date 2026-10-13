@@ -7,6 +7,9 @@
   ],
   "routes": [
     { "src": "/sp-insurance-platform/(.*)", "dest": "api/index.py" },
+    { "src": "/refreshtoken", "dest": "api/index.py" },
+    { "src": "/api/(.*)", "dest": "api/index.py" },
+    { "src": "/auth/(.*)", "dest": "api/index.py" },
     { "src": "/health", "dest": "api/index.py" },
     { "src": "/", "dest": "api/index.py" }
   ]

@@ -54,6 +54,29 @@ set REFRESH_TTL_SECONDS=604800
 
 Refresh tokens live in `api/tokens.json` (git-ignored, hashed with SHA-256).
 
+## Spinny token vault (`/refreshtoken`)
+
+Same shape as the reference refreshtoken service — OTP page gated by a key,
+saved Spinny access token on disk with live expiry status:
+
+```text
+GET  /refreshtoken?key=abhi               dark OTP page (phone + OTP inputs)
+POST /api/request-otp?key=abhi   {phone}  -> {ok, message}
+POST /api/verify-otp?key=abhi {phone,otp} -> {ok, exp, token}, token saved
+GET  /api/token-status?key=abhi           -> {ok, present, phone, exp, expired}
+```
+
+```cmd
+set REFRESH_VAULT_KEY=abhi
+set SPINNY_REQUEST_OTP_URL=https://...request-otp
+set SPINNY_VERIFY_OTP_URL=https://...verify-otp
+```
+
+Until the real Spinny OTP endpoint URLs are set, request/verify answer
+`{ok: false, message: "Spinny OTP upstream not configured ..."}`.
+Vault lives in `api/spinny_token.json` (git-ignored); expiry is decoded
+from the JWT `exp` claim.
+
 ## Endpoints
 
 ```text

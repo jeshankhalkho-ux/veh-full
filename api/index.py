@@ -483,6 +483,232 @@ def auth_logout():
     return jsonify({"status": "success", "message": "Logged out"})
 
 
+# ------------------------------------------------------- spinny vault ---
+# Same shape as the reference refreshtoken service:
+#   GET  /refreshtoken?key=...               -> OTP page (vault key gate)
+#   POST /api/request-otp?key=...   {phone}  -> {ok, message}
+#   POST /api/verify-otp?key=... {phone,otp} -> {ok, exp, token} (saves vault)
+#   GET  /api/token-status?key=...           -> {ok, present, phone, exp, expired}
+# Wire the real Spinny OTP endpoints via env:
+#   SPINNY_REQUEST_OTP_URL / SPINNY_VERIFY_OTP_URL
+VAULT_KEY = os.environ.get("REFRESH_VAULT_KEY", "abhi")
+SPINNY_REQUEST_OTP_URL = os.environ.get("SPINNY_REQUEST_OTP_URL", "")
+SPINNY_VERIFY_OTP_URL = os.environ.get("SPINNY_VERIFY_OTP_URL", "")
+VAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spinny_token.json")
+
+REFRESH_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Spinny Token Refresh</title>
+<style>
+  :root { --bg:#0b0f14; --card:#141a22; --line:#243041; --txt:#e8eef7; --mut:#8b9bb4; --acc:#3b82f6; --ok:#22c55e; --bad:#ef4444; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .card{width:100%;max-width:420px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:28px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+  h1{margin:0 0 6px;font-size:1.25rem}
+  p.sub{margin:0 0 20px;color:var(--mut);font-size:.9rem}
+  label{display:block;font-size:.8rem;color:var(--mut);margin:12px 0 6px}
+  input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--line);background:#0e141c;color:var(--txt);font-size:1rem}
+  input:focus{outline:none;border-color:var(--acc)}
+  .row{display:flex;gap:10px;margin-top:16px}
+  button{flex:1;padding:12px;border:0;border-radius:10px;font-weight:600;cursor:pointer;font-size:.95rem}
+  .primary{background:var(--acc);color:#fff}
+  .ghost{background:#1c2533;color:var(--txt)}
+  .status{margin-top:16px;padding:12px;border-radius:10px;background:#0e141c;border:1px solid var(--line);font-size:.9rem;white-space:pre-wrap;word-break:break-all}
+  .ok{border-color:rgba(34,197,94,.4);color:var(--ok)}
+  .bad{border-color:rgba(239,68,68,.4);color:var(--bad)}
+  .muted{color:var(--mut)}
+  .step{font-size:.75rem;color:var(--mut);margin-bottom:8px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Spinny Token Refresh</h1>
+  <p class="sub">Apna number + OTP se naya access token save hoga.</p>
+  <div class="step" id="cur">Current: checking...</div>
+
+  <label>Phone (10 digit)</label>
+  <input id="phone" type="tel" maxlength="10" placeholder="9xxxxxxxxx" value=""/>
+
+  <label>OTP</label>
+  <input id="otp" type="text" maxlength="8" placeholder="After request OTP"/>
+
+  <div class="row">
+    <button class="ghost" onclick="reqOtp()">1. Request OTP</button>
+    <button class="primary" onclick="verify()">2. Verify &amp; Save</button>
+  </div>
+  <div id="status" class="status muted">Ready</div>
+</div>
+<script>
+const KEY = "__VAULT_KEY__";
+async function cur(){
+  try{
+    const r=await fetch('/api/token-status?key='+encodeURIComponent(KEY));
+    const j=await r.json();
+    document.getElementById('cur').textContent = j.present
+      ? 'Current: '+(j.phone||'?')+' \\u00b7 exp '+(j.exp||'?')+' \\u00b7 '+(j.expired?'EXPIRED':'OK')
+      : 'Current: \\u2014 \\u00b7 exp \\u2014 \\u00b7 MISSING';
+  }catch(e){ document.getElementById('cur').textContent='Current: unknown'; }
+}
+async function reqOtp(){
+  const phone=document.getElementById('phone').value.trim();
+  set('Requesting OTP...','');
+  const r=await fetch('/api/request-otp?key='+encodeURIComponent(KEY),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone})});
+  const j=await r.json();
+  set(j.message||JSON.stringify(j), j.ok?'ok':'bad');
+}
+async function verify(){
+  const phone=document.getElementById('phone').value.trim();
+  const otp=document.getElementById('otp').value.trim();
+  set('Verifying...','');
+  const r=await fetch('/api/verify-otp?key='+encodeURIComponent(KEY),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,otp})});
+  const j=await r.json();
+  if(j.ok){ set('Token saved. Expiry: '+j.exp+'\\n'+(j.token||'').slice(0,40)+'...','ok'); cur(); }
+  else set(j.message||JSON.stringify(j),'bad');
+}
+function set(t,c){const e=document.getElementById('status');e.textContent=t;e.className='status '+(c||'muted');}
+cur();
+</script>
+</body>
+</html>"""
+
+
+def _load_vault():
+    try:
+        with open(VAULT_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_vault(vault):
+    tmp = VAULT_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(vault, fh, indent=2)
+    os.replace(tmp, VAULT_PATH)
+
+
+def jwt_payload_unverified(token):
+    try:
+        parts = str(token).split(".")
+        if len(parts) != 3:
+            return None
+        return json.loads(_b64url_dec(parts[1]))
+    except Exception:
+        return None
+
+
+def vault_status():
+    v = _load_vault()
+    exp = v.get("exp")
+    return {
+        "present": bool(v.get("token")),
+        "phone": v.get("phone"),
+        "exp": v.get("exp_iso"),
+        "expired": True if not exp else int(exp) < int(time.time()),
+        "updated_at": v.get("updated_at"),
+    }
+
+
+def require_vault_key(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if request.args.get("key", "") != VAULT_KEY:
+            if "text/html" in request.headers.get("Accept", ""):
+                return "Forbidden (bad key)", 403
+            return jsonify({"ok": False, "message": "Forbidden (bad key)"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _call_spinny(url, payload):
+    r = requests.post(url, json=payload, headers={
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Origin": "https://www.spinnyinsurance.com",
+        "Referer": "https://www.spinnyinsurance.com/",
+    }, timeout=20)
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, {"raw": r.text[:500]}
+
+
+def _extract_token(data):
+    if not isinstance(data, dict):
+        return None
+    for k in ("access_token", "accessToken", "token", "id_token"):
+        if data.get(k):
+            return data[k]
+    nested = data.get("data")
+    if isinstance(nested, dict):
+        for k in ("access_token", "accessToken", "token"):
+            if nested.get(k):
+                return nested[k]
+    return None
+
+
+@app.route("/refreshtoken", methods=["GET"])
+@require_vault_key
+def refreshtoken_page():
+    return REFRESH_PAGE.replace("__VAULT_KEY__", VAULT_KEY), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/api/request-otp", methods=["POST"])
+@limiter.limit("10 per minute")
+@require_vault_key
+def vault_request_otp():
+    body = request.get_json(silent=True) or {}
+    phone = re.sub(r"\D", "", str(body.get("phone", "")))
+    if len(phone) != 10:
+        return jsonify({"ok": False, "message": "Enter a 10-digit phone number"})
+    if not SPINNY_REQUEST_OTP_URL:
+        return jsonify({"ok": False, "message": "Spinny OTP upstream not configured — set SPINNY_REQUEST_OTP_URL"})
+    try:
+        code, data = _call_spinny(SPINNY_REQUEST_OTP_URL, {"phone": phone, "mobile": phone})
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Upstream error: {e}"})
+    msg = data.get("message") if isinstance(data, dict) else None
+    return jsonify({"ok": code == 200, "message": msg or ("OTP sent" if code == 200 else f"Upstream HTTP {code}")})
+
+
+@app.route("/api/verify-otp", methods=["POST"])
+@limiter.limit("10 per minute")
+@require_vault_key
+def vault_verify_otp():
+    body = request.get_json(silent=True) or {}
+    phone = re.sub(r"\D", "", str(body.get("phone", "")))
+    otp = str(body.get("otp", "")).strip()
+    if len(phone) != 10 or not otp:
+        return jsonify({"ok": False, "message": "Phone (10 digit) + OTP required"})
+    if not SPINNY_VERIFY_OTP_URL:
+        return jsonify({"ok": False, "message": "Spinny OTP upstream not configured — set SPINNY_VERIFY_OTP_URL"})
+    try:
+        code, data = _call_spinny(SPINNY_VERIFY_OTP_URL, {"phone": phone, "mobile": phone, "otp": otp})
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Upstream error: {e}"})
+    token = _extract_token(data)
+    if code != 200 or not token:
+        msg = data.get("message") if isinstance(data, dict) else None
+        return jsonify({"ok": False, "message": msg or "OTP verification failed"})
+    payload = jwt_payload_unverified(token) or {}
+    exp = int(payload.get("exp", 0)) or None
+    exp_iso = datetime.fromtimestamp(exp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
+    with _store_lock:
+        _save_vault({"token": token, "phone": phone, "exp": exp,
+                     "exp_iso": exp_iso, "updated_at": now_iso()})
+    return jsonify({"ok": True, "exp": exp_iso, "token": token})
+
+
+@app.route("/api/token-status", methods=["GET"])
+@require_vault_key
+def vault_token_status():
+    return jsonify({"ok": True, **vault_status()})
+
+
 # ------------------------------------------------------------------ routes ---
 
 @app.route("/")
@@ -496,6 +722,8 @@ def home():
             "logout": "POST /auth/logout {refresh_token}",
             "get_lead": f"GET {BASE}/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458  (Bearer auth)",
             "get_or_create": f"POST {BASE}/get-or-create-lead/  (Bearer auth)",
+            "refreshtoken": "GET /refreshtoken?key=abhi  (Spinny OTP vault page)",
+            "token_status": "GET /api/token-status?key=abhi",
             "health": "GET /health",
         },
         "rate_limit": "10 requests/minute per IP on lead endpoints",

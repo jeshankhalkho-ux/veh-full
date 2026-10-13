@@ -4,4 +4,6 @@ leads.json
 leads.json.tmp
 tokens.json
 tokens.json.tmp
+spinny_token.json
+spinny_token.json.tmp
 .venv/
