@@ -8,15 +8,20 @@
 # (SMC Insurance, ACKO VehicleInfo, VahanX, vahandetails), merged.
 # Leads are kept in leads.json next to this file (dev store — ephemeral
 # on serverless; plug in a real DB for production).
+import base64
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import wraps
 from html import unescape
 
 import requests
@@ -35,6 +40,27 @@ logger = logging.getLogger(__name__)
 BASE = "/sp-insurance-platform/api/v1/leads"
 STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leads.json")
 _store_lock = threading.Lock()
+
+# ------------------------------------------------------------------- auth ---
+# Short-lived JWT access tokens (default 15 min) + opaque rotating refresh
+# tokens (default 7 days). Configure via env:
+#   JWT_SECRET=...  ACCESS_TTL_SECONDS=900  REFRESH_TTL_SECONDS=604800
+#   API_USERS="admin:secret,staff:other"
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me")
+if JWT_SECRET == "dev-secret-change-me":
+    logger.warning("JWT_SECRET not set — using insecure dev default; set JWT_SECRET in production")
+if "API_USERS" not in os.environ:
+    logger.warning("API_USERS not set — using dev default admin:admin")
+ACCESS_TTL = int(os.environ.get("ACCESS_TTL_SECONDS", "900"))
+REFRESH_TTL = int(os.environ.get("REFRESH_TTL_SECONDS", "604800"))
+TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
+
+API_USERS = {}
+for _pair in os.environ.get("API_USERS", "admin:admin").split(","):
+    if ":" in _pair:
+        _u, _p = _pair.split(":", 1)
+        if _u.strip():
+            API_USERS[_u.strip()] = _p
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 MOBILE_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36"
@@ -327,6 +353,66 @@ def save_lead(lead):
         _save_store(store)
 
 
+def _load_tokens():
+    try:
+        with open(TOKEN_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def _save_tokens(tokens):
+    tmp = TOKEN_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(tokens, fh, indent=2)
+    os.replace(tmp, TOKEN_PATH)
+
+
+def _b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_dec(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def jwt_encode(payload):
+    head = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(JWT_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{_b64url(sig)}"
+
+
+def jwt_decode(token):
+    try:
+        head, body, sig = str(token).split(".")
+        expect = hmac.new(JWT_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(_b64url(expect), sig):
+            return None
+        payload = json.loads(_b64url_dec(body))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def issue_pair(username):
+    now = int(time.time())
+    access = jwt_encode({"sub": username, "iat": now, "exp": now + ACCESS_TTL})
+    refresh = secrets.token_urlsafe(32)
+    with _store_lock:
+        tokens = _load_tokens()
+        tokens[hashlib.sha256(refresh.encode()).hexdigest()] = {
+            "sub": username, "exp": now + REFRESH_TTL, "created_at": now_iso(),
+        }
+        tokens = {h: r for h, r in tokens.items() if r.get("exp", 0) >= now}
+        _save_tokens(tokens)
+    return {"access_token": access, "refresh_token": refresh,
+            "token_type": "Bearer", "expires_in": ACCESS_TTL}
+
+
 # ----------------------------------------------------------------- helpers ---
 
 REG_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}$")
@@ -340,6 +426,63 @@ def valid_reg(reg):
     return bool(REG_RE.match(reg))
 
 
+def require_auth(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"status": "failed", "message": "Missing Bearer access token"}), 401
+        payload = jwt_decode(auth[7:].strip())
+        if not payload:
+            return jsonify({"status": "failed",
+                            "message": "Invalid or expired access token — POST /auth/refresh to renew"}), 401
+        request.api_user = payload.get("sub")
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+@app.route("/auth/login", methods=["POST"])
+@limiter.limit("10 per minute")
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    username = str(body.get("username", "")).strip()
+    if not username or API_USERS.get(username) != str(body.get("password", "")):
+        return jsonify({"status": "failed", "message": "Invalid credentials"}), 401
+    return jsonify({"status": "success", "username": username, **issue_pair(username)})
+
+
+@app.route("/auth/refresh", methods=["POST"])
+@limiter.limit("30 per minute")
+def auth_refresh():
+    body = request.get_json(silent=True) or {}
+    rt = str(body.get("refresh_token", ""))
+    if not rt:
+        return jsonify({"status": "failed", "message": "refresh_token is required"}), 401
+    digest = hashlib.sha256(rt.encode()).hexdigest()
+    now = int(time.time())
+    with _store_lock:
+        tokens = _load_tokens()
+        rec = tokens.pop(digest, None)
+        _save_tokens(tokens)
+    if not rec or rec.get("exp", 0) < now:
+        return jsonify({"status": "failed",
+                        "message": "Refresh token expired, revoked or already used — POST /auth/login again"}), 401
+    return jsonify({"status": "success", "username": rec.get("sub"),
+                    "rotated": True, **issue_pair(rec.get("sub"))})
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    body = request.get_json(silent=True) or {}
+    rt = str(body.get("refresh_token", ""))
+    if rt:
+        with _store_lock:
+            tokens = _load_tokens()
+            tokens.pop(hashlib.sha256(rt.encode()).hexdigest(), None)
+            _save_tokens(tokens)
+    return jsonify({"status": "success", "message": "Logged out"})
+
+
 # ------------------------------------------------------------------ routes ---
 
 @app.route("/")
@@ -348,8 +491,11 @@ def home():
         "status": "running",
         "message": "Vehicle lead API — Spinny insurance-platform shape",
         "endpoints": {
-            "get_lead": f"GET {BASE}/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458",
-            "get_or_create": f"POST {BASE}/get-or-create-lead/",
+            "login": "POST /auth/login {username, password}",
+            "refresh": "POST /auth/refresh {refresh_token}",
+            "logout": "POST /auth/logout {refresh_token}",
+            "get_lead": f"GET {BASE}/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458  (Bearer auth)",
+            "get_or_create": f"POST {BASE}/get-or-create-lead/  (Bearer auth)",
             "health": "GET /health",
         },
         "rate_limit": "10 requests/minute per IP on lead endpoints",
@@ -365,6 +511,7 @@ def health():
 
 @app.route(f"{BASE}/get-lead-by-registration-or-proposal/", methods=["GET"])
 @limiter.limit("10 per minute")
+@require_auth
 def get_lead_by_registration_or_proposal():
     reg = normalize_reg(request.args.get("car_registration_number", ""))
     if not reg:
@@ -395,6 +542,7 @@ def get_lead_by_registration_or_proposal():
 
 @app.route(f"{BASE}/get-or-create-lead/", methods=["POST"])
 @limiter.limit("10 per minute")
+@require_auth
 def get_or_create_lead():
     body = request.get_json(silent=True) or {}
     reg = normalize_reg(body.get("car_registration_number", ""))
