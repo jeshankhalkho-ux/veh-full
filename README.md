@@ -124,6 +124,19 @@ reports no lead (or errors), it falls back to local mode
 `"spinny_note"` with Spinny's message). Spinny 401/403 → re-verify
 message. With no vault token the GET/POST are local-only.
 
+Real Spinny schemas (captured 2026-10-13) the router is verified against:
+
+```json
+// GET lead found (JH05DS6144) -> passed through verbatim
+{"success": true, "message": "Successful.", "data": null, "lead_id": 3238273,
+ "lead_flow_type": "default", "assigned_to_id": 1939495,
+ "car_info": {"regNo": "JH05DS6144"}, "lead_status": "quote_generated"}
+
+// GET no lead -> local fallback + spinny_note
+{"success": false, "message": "No lead found for the provided registration number.",
+ "data": null, "lead_id": null, "car_info": {}, "lead_status": null}
+```
+
 Create-a-lead body (JSON):
 
 ```json
