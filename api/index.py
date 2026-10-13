@@ -812,6 +812,67 @@ def vault_debug_spinny():
 
 # ------------------------------------------------------------------ routes ---
 
+SPINNY_API = "https://api.spinnyinsurance.com"
+CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+
+
+def _spinny_lead_headers():
+    v = _load_vault()
+    tok = v.get("token") if isinstance(v, dict) else None
+    if not tok:
+        return None
+    return {
+        "User-Agent": CHROME_UA,
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.spinnyinsurance.com",
+        "Referer": "https://www.spinnyinsurance.com/",
+        "Cookie": f"access_token={tok}",
+        "Authorization": f"Bearer {tok}",
+    }
+
+
+def _spinny_call(method, suffix, params=None, payload=None):
+    """Call the real Spinny API with the vault token.
+
+    Returns (http_status, data), or None when no Spinny token is saved
+    (caller falls back to the local lead store + live RC lookup)."""
+    headers = _spinny_lead_headers()
+    if not headers:
+        return None
+    url = SPINNY_API + BASE + suffix
+    if method == "GET":
+        r = requests.get(url, params=params, headers=headers, timeout=25)
+    else:
+        r = requests.post(url, json=payload, headers=headers, timeout=25)
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, {"raw": r.text[:500]}
+
+
+def _spinny_gone():
+    return jsonify({"status": "failed",
+                    "message": "Spinny rejected the saved token — re-verify at /refreshtoken"}), 502
+
+
+def require_api_access(fn):
+    """Our login Bearer OR the vault ?key=. (The vault key gates the Spinny proxy.)"""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and jwt_decode(auth[7:].strip()):
+            return fn(*args, **kwargs)
+        if request.args.get("key", "") == VAULT_KEY:
+            return fn(*args, **kwargs)
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            if isinstance(body, dict) and body.get("key", "") == VAULT_KEY:
+                return fn(*args, **kwargs)
+        return jsonify({"status": "failed", "message": "Login first (POST /auth/login) or pass ?key=<vault-key>; save a Spinny token at /refreshtoken"}), 401
+    return wrapper
+
+
 @app.route("/")
 def home():
     return jsonify({
@@ -821,8 +882,8 @@ def home():
             "login": "POST /auth/login {username, password}",
             "refresh": "POST /auth/refresh {refresh_token}",
             "logout": "POST /auth/logout {refresh_token}",
-            "get_lead": f"GET {BASE}/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458  (Bearer auth)",
-            "get_or_create": f"POST {BASE}/get-or-create-lead/  (Bearer auth)",
+            "get_lead": f"GET {BASE}/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458&key=abhi  (login Bearer or ?key=; proxies real Spinny when vault token saved)",
+            "get_or_create": f"POST {BASE}/get-or-create-lead/  (login Bearer or key in query/body; proxies real Spinny when vault token saved)",
             "refreshtoken": "GET /refreshtoken?key=abhi  (Spinny OTP vault page)",
             "token_status": "GET /api/token-status?key=abhi",
             "health": "GET /health",
@@ -840,13 +901,25 @@ def health():
 
 @app.route(f"{BASE}/get-lead-by-registration-or-proposal/", methods=["GET"])
 @limiter.limit("10 per minute")
-@require_auth
+@require_api_access
 def get_lead_by_registration_or_proposal():
     reg = normalize_reg(request.args.get("car_registration_number", ""))
     if not reg:
         return jsonify({"status": "failed", "message": "Missing car_registration_number"}), 400
     if not valid_reg(reg):
         return jsonify({"status": "failed", "message": f"Invalid registration number: {reg}"}), 400
+
+    # Real Spinny first (vault token), local fallback when no token saved.
+    try:
+        proxied = _spinny_call("GET", "/get-lead-by-registration-or-proposal/",
+                               params={"car_registration_number": reg})
+    except Exception as e:
+        return jsonify({"status": "failed", "message": f"Spinny upstream error: {e}"}), 502
+    if proxied is not None:
+        code, data = proxied
+        if code in (401, 403):
+            return _spinny_gone()
+        return jsonify(data), code
 
     lead = get_lead(reg)
     vehicle, sources = lookup_vehicle(reg)
@@ -862,6 +935,7 @@ def get_lead_by_registration_or_proposal():
 
     return jsonify({
         "status": "success",
+        "mode": "local",
         "car_registration_number": reg,
         "lead": lead,
         "proposal": (lead or {}).get("proposal"),
@@ -871,18 +945,32 @@ def get_lead_by_registration_or_proposal():
 
 @app.route(f"{BASE}/get-or-create-lead/", methods=["POST"])
 @limiter.limit("10 per minute")
-@require_auth
+@require_api_access
 def get_or_create_lead():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
     reg = normalize_reg(body.get("car_registration_number", ""))
     if not reg:
         return jsonify({"status": "failed", "message": "car_registration_number is required"}), 400
     if not valid_reg(reg):
         return jsonify({"status": "failed", "message": f"Invalid registration number: {reg}"}), 400
 
+    # Real Spinny first (vault token), local fallback when no token saved.
+    try:
+        passthrough = {k: v for k, v in body.items() if k != "key"}
+        proxied = _spinny_call("POST", "/get-or-create-lead/", payload=passthrough)
+    except Exception as e:
+        return jsonify({"status": "failed", "message": f"Spinny upstream error: {e}"}), 502
+    if proxied is not None:
+        code, data = proxied
+        if code in (401, 403):
+            return _spinny_gone()
+        return jsonify(data), code
+
     existing = get_lead(reg)
     if existing:
-        return jsonify({"status": "success", "created": False, "lead": existing})
+        return jsonify({"status": "success", "mode": "local", "created": False, "lead": existing})
 
     vehicle, sources = lookup_vehicle(reg)
     if vehicle:
@@ -905,7 +993,7 @@ def get_or_create_lead():
     lead = {k: v for k, v in lead.items() if v is not None}
     lead.setdefault("proposal", None)
     save_lead(lead)
-    return jsonify({"status": "success", "created": True, "lead": lead})
+    return jsonify({"status": "success", "mode": "local", "created": True, "lead": lead})
 
 
 if __name__ == "__main__":

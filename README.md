@@ -108,11 +108,18 @@ Troubleshooting verify hangs/failures (Render):
 ## Endpoints
 
 ```text
-GET  /sp-insurance-platform/api/v1/leads/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458
-POST /sp-insurance-platform/api/v1/leads/get-or-create-lead/
+GET  /sp-insurance-platform/api/v1/leads/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458&key=abhi
+POST /sp-insurance-platform/api/v1/leads/get-or-create-lead/   (key in query or body)
 GET  /health
 GET  /
 ```
+
+Access: our login `Authorization: Bearer` **or** the vault `?key=`
+(no credential → 401 pointing at both). When a Spinny token is saved in
+the vault, both lead endpoints proxy the **real Spinny API** with it
+(response passed through verbatim; Spinny 401/403 → re-verify message).
+With no vault token they fall back to local mode (`"mode": "local"`:
+our lead store + live RC lookup).
 
 Create-a-lead body (JSON):
 
