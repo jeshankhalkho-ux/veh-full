@@ -18,6 +18,7 @@ import os
 import random
 import re
 import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -326,20 +327,50 @@ def lookup_vehicle(vnum):
 
 # ------------------------------------------------------------------ store ---
 
-def _load_store():
+_MEM = {}
+
+
+def _write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def _load_json(path, mem_key):
+    """disk -> /tmp -> memory. Serverless (Vercel) is read-only except /tmp."""
+    for candidate in (path, os.path.join(tempfile.gettempdir(), os.path.basename(path))):
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+        except (FileNotFoundError, ValueError, OSError):
+            continue
+    return _MEM.get(mem_key, {})
+
+
+def _save_json(path, mem_key, obj):
+    """Best-effort save, never raises. Returns disk | tmp | memory."""
     try:
-        with open(STORE_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError):
-        return {}
+        _write_json(path, obj)
+        return "disk"
+    except OSError:
+        pass
+    try:
+        _write_json(os.path.join(tempfile.gettempdir(), os.path.basename(path)), obj)
+        return "tmp"
+    except OSError:
+        _MEM[mem_key] = obj
+        return "memory"
+
+
+def _load_store():
+    return _load_json(STORE_PATH, "leads")
 
 
 def _save_store(store):
-    tmp = STORE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(store, fh, indent=2)
-    os.replace(tmp, STORE_PATH)
+    _save_json(STORE_PATH, "leads", store)
 
 
 def get_lead(reg):
@@ -355,19 +386,11 @@ def save_lead(lead):
 
 
 def _load_tokens():
-    try:
-        with open(TOKEN_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError):
-        return {}
+    return _load_json(TOKEN_PATH, "tokens")
 
 
 def _save_tokens(tokens):
-    tmp = TOKEN_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(tokens, fh, indent=2)
-    os.replace(tmp, TOKEN_PATH)
+    _save_json(TOKEN_PATH, "tokens", tokens)
 
 
 def _b64url(data):
@@ -607,19 +630,11 @@ cur();
 
 
 def _load_vault():
-    try:
-        with open(VAULT_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, ValueError):
-        return {}
+    return _load_json(VAULT_PATH, "vault")
 
 
 def _save_vault(vault):
-    tmp = VAULT_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(vault, fh, indent=2)
-    os.replace(tmp, VAULT_PATH)
+    return _save_json(VAULT_PATH, "vault", vault)
 
 
 def jwt_payload_unverified(token):
@@ -658,14 +673,17 @@ def require_vault_key(fn):
 def _call_spinny(url, payload):
     t0 = time.time()
     r = requests.post(url, json=payload, headers={
-        "User-Agent": USER_AGENT,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://www.spinnyinsurance.com",
         "Referer": "https://www.spinnyinsurance.com/",
     }, timeout=20)
     ms = int((time.time() - t0) * 1000)
     short = "/".join(url.rstrip("/").rsplit("/", 2)[-2:])
     logger.info("spinny POST %s -> HTTP %s in %sms", short, r.status_code, ms)
+    if r.status_code != 200:
+        logger.info("spinny POST %s error body: %.500s", short, r.text)
     try:
         data = r.json()
     except ValueError:
@@ -685,6 +703,22 @@ def _extract_token(data):
             if nested.get(k):
                 return nested[k]
     return None
+
+
+def _spinny_error(data, code):
+    """Pull a human reason out of Spinny's error body (plain or DRF-style)."""
+    if isinstance(data, dict):
+        for k in ("message", "error", "detail", "msg"):
+            if data.get(k):
+                return str(data[k])[:300]
+        bits = []
+        for k, v in data.items():
+            if k in ("access_token", "token", "id_token"):
+                continue
+            bits.append(f"{k}: {', '.join(map(str, v)) if isinstance(v, list) else v}")
+        if bits:
+            return "; ".join(bits)[:300]
+    return f"OTP verification failed (HTTP {code})"
 
 
 @app.route("/refreshtoken", methods=["GET"])
@@ -710,8 +744,10 @@ def vault_request_otp():
             SPINNY_REQUEST_OTP_URL, {"phone_number": phone, "whatsapp_opt_in": True})
     except Exception as e:
         return jsonify({"ok": False, "message": f"Upstream error: {e}"})
+    if code != 200:
+        return jsonify({"ok": False, "message": _spinny_error(data, code), "upstream_http": code})
     msg = data.get("message") if isinstance(data, dict) else None
-    return jsonify({"ok": code == 200, "message": msg or ("OTP sent" if code == 200 else f"Upstream HTTP {code}")})
+    return jsonify({"ok": True, "message": msg or "OTP sent"})
 
 
 @app.route("/api/verify-otp", methods=["POST"])
@@ -736,8 +772,7 @@ def vault_verify_otp():
         return jsonify({"ok": False, "message": f"Upstream error: {e}"})
     token = _extract_token(data) or cookies.get("access_token")
     if code != 200 or not token:
-        msg = data.get("message") if isinstance(data, dict) else None
-        return jsonify({"ok": False, "message": msg or f"OTP verification failed (HTTP {code})"})
+        return jsonify({"ok": False, "message": _spinny_error(data, code), "upstream_http": code})
     payload = jwt_payload_unverified(token) or {}
     try:
         exp = int(payload.get("exp", 0)) or None
@@ -745,9 +780,9 @@ def vault_verify_otp():
         exp = None
     exp_iso = datetime.fromtimestamp(exp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
     with _store_lock:
-        _save_vault({"token": token, "phone": phone, "exp": exp,
-                     "exp_iso": exp_iso, "updated_at": now_iso()})
-    return jsonify({"ok": True, "exp": exp_iso, "token": token})
+        persisted = _save_vault({"token": token, "phone": phone, "exp": exp,
+                                 "exp_iso": exp_iso, "updated_at": now_iso()})
+    return jsonify({"ok": True, "exp": exp_iso, "token": token, "persisted": persisted or False})
 
 
 @app.route("/api/token-status", methods=["GET"])

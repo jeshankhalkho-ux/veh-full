@@ -81,6 +81,15 @@ Token is accepted from the JSON body or the `Set-Cookie` fallback.
 Vault lives in `api/spinny_token.json` (git-ignored); expiry is decoded
 from the JWT `exp` claim. Tokens are 24-hour, so re-verify daily.
 
+OTP discipline (Spinny rejects stale codes with HTTP 400): tap Request OTP
+**once**, then Verify within minutes using the **latest** OTP on the
+**same** number. Each new request kills the previous OTP. Failure replies
+now carry Spinny's real reason plus `upstream_http`.
+
+Vercel note: functions are read-only except `/tmp`, so stores fall back
+disk → `/tmp` → memory (verify replies include `"persisted"`). Vault data
+may not survive cold starts — copy the returned token on success.
+
 Troubleshooting verify hangs/failures (Render):
 
 - The page now times out at 60s and always shows the result — redeploy and
