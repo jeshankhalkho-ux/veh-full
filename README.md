@@ -68,14 +68,18 @@ GET  /api/token-status?key=abhi           -> {ok, present, phone, exp, expired}
 
 ```cmd
 set REFRESH_VAULT_KEY=abhi
-set SPINNY_REQUEST_OTP_URL=https://...request-otp
-set SPINNY_VERIFY_OTP_URL=https://...verify-otp
 ```
 
-Until the real Spinny OTP endpoint URLs are set, request/verify answer
-`{ok: false, message: "Spinny OTP upstream not configured ..."}`.
+Wired to Spinny's real OTP API by default (override with
+`SPINNY_REQUEST_OTP_URL` / `SPINNY_VERIFY_OTP_URL`):
+
+- request: `{phone_number, whatsapp_opt_in: true}` → `{message}`
+- verify: `{phone_number, otp, cid}` → `{access_token, token_type}` (+ cookie)
+
+`cid` is Spinny's GA-style client id — generated fresh per attempt.
+Token is accepted from the JSON body or the `Set-Cookie` fallback.
 Vault lives in `api/spinny_token.json` (git-ignored); expiry is decoded
-from the JWT `exp` claim.
+from the JWT `exp` claim. Tokens are 24-hour, so re-verify daily.
 
 ## Endpoints
 

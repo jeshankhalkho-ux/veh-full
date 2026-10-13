@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import threading
@@ -489,11 +490,17 @@ def auth_logout():
 #   POST /api/request-otp?key=...   {phone}  -> {ok, message}
 #   POST /api/verify-otp?key=... {phone,otp} -> {ok, exp, token} (saves vault)
 #   GET  /api/token-status?key=...           -> {ok, present, phone, exp, expired}
-# Wire the real Spinny OTP endpoints via env:
+# Upstream is Spinny's real OTP API by default (override via env):
 #   SPINNY_REQUEST_OTP_URL / SPINNY_VERIFY_OTP_URL
+# otp-request: {phone_number, whatsapp_opt_in} -> {message}
+# verify-otp:  {phone_number, otp, cid}       -> {access_token, token_type} (+ cookie)
 VAULT_KEY = os.environ.get("REFRESH_VAULT_KEY", "abhi")
-SPINNY_REQUEST_OTP_URL = os.environ.get("SPINNY_REQUEST_OTP_URL", "")
-SPINNY_VERIFY_OTP_URL = os.environ.get("SPINNY_VERIFY_OTP_URL", "")
+SPINNY_REQUEST_OTP_URL = os.environ.get(
+    "SPINNY_REQUEST_OTP_URL",
+    "https://api.spinnyinsurance.com/sp-insurance-platform/api/v1/accounts/otp-request/")
+SPINNY_VERIFY_OTP_URL = os.environ.get(
+    "SPINNY_VERIFY_OTP_URL",
+    "https://api.spinnyinsurance.com/sp-insurance-platform/api/v1/accounts/verify-otp/")
 VAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spinny_token.json")
 
 REFRESH_PAGE = """<!DOCTYPE html>
@@ -632,9 +639,10 @@ def _call_spinny(url, payload):
         "Referer": "https://www.spinnyinsurance.com/",
     }, timeout=20)
     try:
-        return r.status_code, r.json()
+        data = r.json()
     except ValueError:
-        return r.status_code, {"raw": r.text[:500]}
+        data = {"raw": r.text[:500]}
+    return r.status_code, data, dict(r.cookies)
 
 
 def _extract_token(data):
@@ -668,7 +676,8 @@ def vault_request_otp():
     if not SPINNY_REQUEST_OTP_URL:
         return jsonify({"ok": False, "message": "Spinny OTP upstream not configured — set SPINNY_REQUEST_OTP_URL"})
     try:
-        code, data = _call_spinny(SPINNY_REQUEST_OTP_URL, {"phone": phone, "mobile": phone})
+        code, data, _cookies = _call_spinny(
+            SPINNY_REQUEST_OTP_URL, {"phone_number": phone, "whatsapp_opt_in": True})
     except Exception as e:
         return jsonify({"ok": False, "message": f"Upstream error: {e}"})
     msg = data.get("message") if isinstance(data, dict) else None
@@ -687,10 +696,13 @@ def vault_verify_otp():
     if not SPINNY_VERIFY_OTP_URL:
         return jsonify({"ok": False, "message": "Spinny OTP upstream not configured — set SPINNY_VERIFY_OTP_URL"})
     try:
-        code, data = _call_spinny(SPINNY_VERIFY_OTP_URL, {"phone": phone, "mobile": phone, "otp": otp})
+        # cid is Spinny's GA-style client id ("<9 digits>.<epoch>"); fresh one per attempt.
+        cid = f"{random.randint(100000000, 999999999)}.{int(time.time())}"
+        code, data, cookies = _call_spinny(
+            SPINNY_VERIFY_OTP_URL, {"phone_number": phone, "otp": otp, "cid": cid})
     except Exception as e:
         return jsonify({"ok": False, "message": f"Upstream error: {e}"})
-    token = _extract_token(data)
+    token = _extract_token(data) or cookies.get("access_token")
     if code != 200 or not token:
         msg = data.get("message") if isinstance(data, dict) else None
         return jsonify({"ok": False, "message": msg or "OTP verification failed"})
