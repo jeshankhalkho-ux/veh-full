@@ -450,6 +450,15 @@ def _rate_limited(e):
     return msg, 429
 
 
+@app.errorhandler(500)
+def _server_error(e):
+    logger.exception("unhandled error on %s", request.path)
+    if request.path.startswith(("/api", "/auth")):
+        return jsonify({"ok": False, "status": "failed",
+                        "message": "Server error — check Render logs for the traceback"}), 500
+    return "Internal server error", 500
+
+
 @app.route("/auth/login", methods=["POST"])
 @limiter.limit("10 per minute")
 def auth_login():
@@ -689,6 +698,8 @@ def refreshtoken_page():
 @require_vault_key
 def vault_request_otp():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
     phone = re.sub(r"\D", "", str(body.get("phone", "")))
     if len(phone) != 10:
         return jsonify({"ok": False, "message": "Enter a 10-digit phone number"})
@@ -708,6 +719,8 @@ def vault_request_otp():
 @require_vault_key
 def vault_verify_otp():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
     phone = re.sub(r"\D", "", str(body.get("phone", "")))
     otp = str(body.get("otp", "")).strip()
     if len(phone) != 10 or not otp:
@@ -726,7 +739,10 @@ def vault_verify_otp():
         msg = data.get("message") if isinstance(data, dict) else None
         return jsonify({"ok": False, "message": msg or f"OTP verification failed (HTTP {code})"})
     payload = jwt_payload_unverified(token) or {}
-    exp = int(payload.get("exp", 0)) or None
+    try:
+        exp = int(payload.get("exp", 0)) or None
+    except (TypeError, ValueError):
+        exp = None
     exp_iso = datetime.fromtimestamp(exp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if exp else None
     with _store_lock:
         _save_vault({"token": token, "phone": phone, "exp": exp,

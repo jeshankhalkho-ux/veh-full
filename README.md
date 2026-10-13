@@ -92,6 +92,9 @@ Troubleshooting verify hangs/failures (Render):
 - Too many taps → JSON `Too many attempts — wait a minute` (10/min).
 - Render → Logs shows `spinny POST accounts/verify-otp -> HTTP <code>`
   lines for the real upstream result.
+- Any server crash now returns JSON (never a blank 500 page) and logs the
+  full traceback — paste the `unhandled error on /api/verify-otp` block
+  from Logs to pinpoint it.
 
 ## Endpoints
 
