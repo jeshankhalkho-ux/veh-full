@@ -1,7 +1,9 @@
 # vehicle-api
 
-Spinny-style vehicle lead API (Flask, Vercel-ready), backed by live RC sources
-(SMC Insurance, ACKO VehicleInfo, VahanX, vahandetails).
+Spinny-style vehicle lead API (Flask, Vercel-ready). Local RC data comes
+from the **separate** vehicle-src project over HTTP — this repo contains
+no scraper code (`VEHICLE_SRC_URL`, default
+`https://vehicle-api-tau.vercel.app`).
 
 ## Run
 
