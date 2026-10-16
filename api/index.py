@@ -551,6 +551,22 @@ def vault_token_status():
     return jsonify({"ok": True, **vault_status()})
 
 
+@app.route("/api/vault-debug", methods=["GET"])
+@require_vault_key
+def vault_debug():
+    """Whose token is stored? Returns sub/phone/expiry — never the token."""
+    v = _load_vault()
+    tok = v.get("token") if isinstance(v, dict) else None
+    payload = jwt_payload_unverified(tok) if tok else None
+    try:
+        exp = int((payload or {}).get("exp", 0)) or None
+    except (TypeError, ValueError):
+        exp = None
+    return jsonify({"ok": True, "phone": v.get("phone"),
+                    "sub": (payload or {}).get("sub"), "exp": exp,
+                    "expired": True if not exp else exp < int(time.time())})
+
+
 def _ping_spinny():
     r = requests.get("https://api.spinnyinsurance.com/", headers={"User-Agent": USER_AGENT}, timeout=10)
     return r.status_code
