@@ -123,6 +123,20 @@ With no vault token they use only our own lead store (`"mode": "local"`,
 no vehicle enrichment): POST creates/fetches the local lead, GET returns
 it or 404 telling you to save a Spinny token at `/refreshtoken`.
 
+## Passing your Spinny token per request (recommended on Vercel)
+
+The vault evaporates on serverless cold starts, so for reliability send
+the token with each call instead — copy `access_token` from DevTools →
+Application → Cookies (valid 24h):
+
+```cmd
+curl "https://<app>/sp-insurance-platform/api/v1/leads/get-lead-by-registration-or-proposal/?car_registration_number=JH05DS6144&key=abhi" ^
+  -H "X-Spinny-Token: <access_token>"
+```
+
+(`?spinny_token=` query param also works, but URLs land in logs —
+header preferred.) Per-request token wins; saved vault is the fallback.
+
 Real Spinny schemas (captured 2026-10-13) the router is verified against:
 
 ```json

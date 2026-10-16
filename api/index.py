@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, has_request_context, jsonify, request
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -593,10 +593,22 @@ CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 
 
 def _spinny_lead_headers():
-    v = _load_vault()
-    tok = v.get("token") if isinstance(v, dict) else None
+    # Per-request token wins (stateless — survives Vercel cold starts);
+    # vault is only a fallback. Header preferred (query strings land in logs).
+    tok, src = None, None
+    if has_request_context():
+        tok = request.headers.get("X-Spinny-Token", "").strip() or \
+            request.args.get("spinny_token", "").strip()
+        if tok:
+            src = "request"
+    if not tok:
+        v = _load_vault()
+        tok = v.get("token") if isinstance(v, dict) else None
+        if tok:
+            src = "vault"
     if not tok:
         return None
+    logger.info("spinny auth via %s token", src)
     return {
         "User-Agent": CHROME_UA,
         "Accept": "application/json",
