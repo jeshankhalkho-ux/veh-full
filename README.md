@@ -1,9 +1,8 @@
 # vehicle-api
 
-Spinny-style vehicle lead API (Flask, Vercel-ready). Local RC data comes
-from the **separate** vehicle-src project over HTTP — this repo contains
-no scraper code (`VEHICLE_SRC_URL`, default
-`https://vehicle-api-tau.vercel.app`).
+Spinny-style vehicle lead API (Flask, Vercel-ready). Fully standalone:
+real Spinny proxy (vault token) plus our own lead store and auth — no
+outside vehicle API, no scraper code in this repo.
 
 ## Run
 
@@ -118,13 +117,11 @@ GET  /
 
 Access: our login `Authorization: Bearer` **or** the vault `?key=`
 (no credential → 401 pointing at both). When a Spinny token is saved in
-the vault, both lead endpoints proxy the **real Spinny API** with it.
-The GET passes Spinny's reply through verbatim only when it contains a
-real lead (`success: true` / `lead_id` / `lead` / `data`); when Spinny
-reports no lead (or errors), it falls back to local mode
-(`"mode": "local"`: our lead store + live RC lookup, plus
-`"spinny_note"` with Spinny's message). Spinny 401/403 → re-verify
-message. With no vault token the GET/POST are local-only.
+the vault, both lead endpoints proxy the **real Spinny API** with it and
+pass the reply through verbatim (Spinny 401/403 → re-verify message).
+With no vault token they use only our own lead store (`"mode": "local"`,
+no vehicle enrichment): POST creates/fetches the local lead, GET returns
+it or 404 telling you to save a Spinny token at `/refreshtoken`.
 
 Real Spinny schemas (captured 2026-10-13) the router is verified against:
 
@@ -134,7 +131,7 @@ Real Spinny schemas (captured 2026-10-13) the router is verified against:
  "lead_flow_type": "default", "assigned_to_id": 1939495,
  "car_info": {"regNo": "JH05DS6144"}, "lead_status": "quote_generated"}
 
-// GET no lead -> local fallback + spinny_note
+// GET no lead -> Spinny's envelope verbatim
 {"success": false, "message": "No lead found for the provided registration number.",
  "data": null, "lead_id": null, "car_info": {}, "lead_status": null}
 ```

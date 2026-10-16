@@ -4,8 +4,8 @@
 #   GET  /sp-insurance-platform/api/v1/leads/get-lead-by-registration-or-proposal/?car_registration_number=JH05CK2458
 #   POST /sp-insurance-platform/api/v1/leads/get-or-create-lead/   (JSON body)
 #
-# Vehicle data comes from the separate vehicle-src project over HTTP
-# (VEHICLE_SRC_URL) — no scraper code lives in this repo.
+# Fully standalone: real Spinny proxy (vault token) plus our own lead
+# store and auth. No outside vehicle API, no scraper code in this repo.
 # Leads are kept in leads.json next to this file (dev store — ephemeral
 # on serverless; plug in a real DB for production).
 import base64
@@ -63,39 +63,6 @@ for _pair in os.environ.get("API_USERS", "admin:admin").split(","):
             API_USERS[_u.strip()] = _p
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-# ------------------------------------------------- local data (old API) ---
-# RC/vehicle details come from the SEPARATE vehicle-src project over HTTP —
-# no scraper code lives here. Override with VEHICLE_SRC_URL if it moves.
-VEHICLE_SRC_URL = os.environ.get("VEHICLE_SRC_URL", "https://vehicle-api-tau.vercel.app").rstrip("/")
-
-
-def lookup_vehicle(vnum):
-    """GET the separate old vehicle API. Returns (merged_dict, [sources])."""
-    r = None
-    for attempt in (1, 2):
-        try:
-            r = requests.get(f"{VEHICLE_SRC_URL}/api/vehicle", params={"vnum": vnum},
-                             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-                             timeout=55)
-            break
-        except Exception as e:
-            logger.warning("old vehicle-api attempt %s failed for %s: %s", attempt, vnum, e)
-            time.sleep(2)
-    if r is None or r.status_code != 200:
-        return None, []
-    try:
-        data = r.json()
-    except ValueError:
-        return None, []
-    if not isinstance(data, dict) or data.get("status") != "success":
-        return None, []
-    data.pop("status", None)
-    sources = data.pop("data_source", []) or []
-    if not data or set(data) <= {"registration_number"}:
-        return None, []
-    return data, sources
-
-
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -629,7 +596,7 @@ def _spinny_call(method, suffix, params=None, payload=None):
     """Call the real Spinny API with the vault token.
 
     Returns (http_status, data), or None when no Spinny token is saved
-    (caller falls back to the local lead store + live RC lookup)."""
+    (caller falls back to the local lead store)."""
     headers = _spinny_lead_headers()
     if not headers:
         return None
@@ -702,9 +669,8 @@ def get_lead_by_registration_or_proposal():
     if not valid_reg(reg):
         return jsonify({"status": "failed", "message": f"Invalid registration number: {reg}"}), 400
 
-    # Real Spinny first (vault token); fall back to local RC data when no
-    # vault token is saved OR Spinny itself reports no lead.
-    spinny_note = None
+    # Fully standalone: real Spinny when a vault token is saved, otherwise
+    # only our own lead store (no outside vehicle API anymore).
     try:
         proxied = _spinny_call("GET", "/get-lead-by-registration-or-proposal/",
                                params={"car_registration_number": reg})
@@ -714,37 +680,23 @@ def get_lead_by_registration_or_proposal():
         code, data = proxied
         if code in (401, 403):
             return _spinny_gone()
-        has_lead = (code == 200 and isinstance(data, dict)
-                    and (data.get("success") is True or data.get("lead_id")
-                         or data.get("lead") or data.get("data")))
-        if has_lead:
-            return jsonify(data), code
-        if isinstance(data, dict) and data.get("message"):
-            spinny_note = str(data["message"])[:200]
+        return jsonify(data), code
 
     lead = get_lead(reg)
-    vehicle, sources = lookup_vehicle(reg)
-    if vehicle:
-        vehicle["sources"] = sources
-
-    if not lead and not vehicle:
+    if lead:
         return jsonify({
-            "status": "failed",
+            "status": "success",
+            "mode": "local",
             "car_registration_number": reg,
-            "message": "No lead, proposal or vehicle found for this registration number",
-        }), 404
-
-    resp = {
-        "status": "success",
-        "mode": "local",
+            "lead": lead,
+            "proposal": lead.get("proposal"),
+            "vehicle": None,
+        })
+    return jsonify({
+        "status": "failed",
         "car_registration_number": reg,
-        "lead": lead,
-        "proposal": (lead or {}).get("proposal"),
-        "vehicle": vehicle,
-    }
-    if spinny_note:
-        resp["spinny_note"] = spinny_note
-    return jsonify(resp)
+        "message": "No Spinny token saved and no local lead — save a token at /refreshtoken first",
+    }), 404
 
 
 @app.route(f"{BASE}/get-or-create-lead/", methods=["POST"])
@@ -760,7 +712,7 @@ def get_or_create_lead():
     if not valid_reg(reg):
         return jsonify({"status": "failed", "message": f"Invalid registration number: {reg}"}), 400
 
-    # Real Spinny first (vault token), local fallback when no token saved.
+    # Real Spinny when a vault token is saved, else our own lead store.
     try:
         passthrough = {k: v for k, v in body.items() if k != "key"}
         proxied = _spinny_call("POST", "/get-or-create-lead/", payload=passthrough)
@@ -776,9 +728,7 @@ def get_or_create_lead():
     if existing:
         return jsonify({"status": "success", "mode": "local", "created": False, "lead": existing})
 
-    vehicle, sources = lookup_vehicle(reg)
-    if vehicle:
-        vehicle["sources"] = sources
+    vehicle = None  # standalone: no outside vehicle API, snapshot stays empty
     stamp = now_iso()
     lead = {
         "id": uuid.uuid4().hex,
